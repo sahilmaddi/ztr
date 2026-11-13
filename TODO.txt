@@ -1,0 +1,8 @@
+test automation connectivity to langraph (query?)
+wsl setup and docker inside it.
+use antigravity/vscode to work on that WSL Linux 
+install docker in it and build entire framework as part of that docker image.
+
+
+
+working antigravity/key for LLM

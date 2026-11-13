@@ -1,0 +1,7 @@
+{
+  "name": "sample-application",
+  "version": "1.0.0",
+  "description": "A harmless sample application package for upload testing.",
+  "entryPoint": "index.html",
+  "type": "static-web-application"
+}

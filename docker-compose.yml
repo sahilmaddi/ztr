@@ -1,0 +1,61 @@
+services:
+  browser:
+    image: selenium/standalone-chrome:4.27.0-20241127
+    shm_size: 2gb
+    ports:
+      - "4444:4444"
+
+  zap:
+    image: ghcr.io/zaproxy/zaproxy:stable
+    command:
+      - zap.sh
+      - -daemon
+      - -host
+      - 0.0.0.0
+      - -port
+      - "8080"
+      - -config
+      - api.key=ztr-local-scan-key
+      - -config
+      - api.addrs.addr.name=.*
+      - -config
+      - api.addrs.addr.regex=true
+    expose:
+      - "8080"
+
+
+  juice-shop:
+    image: bkimminich/juice-shop
+    profiles: ["vulnerable-lab"]
+    ports:
+      - "127.0.0.1:3000:3000"
+    expose:
+      - "3000"
+
+  web:
+    build: ./apps/web
+    ports:
+      - "4200:80"
+    depends_on:
+      - regression
+
+  regression:
+    build: ./services/regression
+    environment:
+      SELENIUM_URL: http://browser:4444
+      ZAP_URL: http://zap:8080
+      ZAP_API_KEY: ztr-local-scan-key
+    ports:
+      - "8100:8100"
+    depends_on:
+      - browser
+      - zap
+
+  robot:
+    build: ./services/robot
+    environment:
+      SELENIUM_URL: http://browser:4444
+    ports:
+      - "8001:8001"
+    depends_on:
+      - browser
