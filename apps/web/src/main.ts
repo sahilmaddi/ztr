@@ -22,16 +22,29 @@ import JSZip from 'jszip';
 
       <section class="workspace" aria-label="Regression workspace">
         <div class="workspace-head">
-          <div><span class="section-kicker">01 / PROJECT</span><h2>Choose a project package</h2></div>
-          <span class="format-pill">ZIP only <span>200 MB max</span></span>
+          <div><span class="section-kicker">01 / PROJECT</span><h2>Choose a project package or repo target</h2></div>
+          <span class="format-pill">ZIP or repo <span>full/app or commit</span></span>
         </div>
 
-        <label class="dropzone" [class.has-file]="file" for="project-file">
+        <div class="source-picker" role="radiogroup" aria-label="Project source type">
+          <label><input type="radio" name="sourceType" value="zip" [checked]="sourceType === 'zip'" (change)="sourceType = 'zip'" /> ZIP package</label>
+          <label><input type="radio" name="sourceType" value="repo" [checked]="sourceType === 'repo'" (change)="sourceType = 'repo'" /> Git repo / commit</label>
+        </div>
+
+        <label class="dropzone" *ngIf="sourceType === 'zip'" [class.has-file]="file" for="project-file">
           <input id="project-file" type="file" accept=".zip,application/zip" (change)="selectFile($event)" />
           <span class="upload-icon" aria-hidden="true"><span></span></span>
           <span class="drop-title">{{ file ? file.name : 'Drop your project here' }}</span>
           <span class="drop-note">{{ file ? formatBytes(file.size) + ' ready for inspection' : 'or click to browse your files' }}</span>
         </label>
+
+        <div class="scan-target" *ngIf="sourceType === 'repo'">
+          <label for="repo-path">Repository path</label>
+          <input id="repo-path" type="text" placeholder="/workspace/app or ." [value]="repoPath" (input)="repoPath = $any($event.target).value" />
+          <small>Use a filesystem path inside the service environment. Leave as <code>.</code> to inspect the current checkout.</small>
+          <label for="commit-id">Commit or ref (optional)</label>
+          <input id="commit-id" type="text" placeholder="main, HEAD, 77db19a" [value]="commitId" (input)="commitId = $any($event.target).value" />
+        </div>
 
         <div class="scan-target">
           <label for="scan-target-url">Optional live Juice Shop target</label>
@@ -41,9 +54,10 @@ import JSZip from 'jszip';
         </div>
 
         <div class="action-row">
-          <span class="helper-text" *ngIf="!file">A project ZIP with an <code>index.html</code> entry point works best.</span>
-          <span class="helper-text selected" *ngIf="file"><span class="checkmark">&#10003;</span> Package selected</span>
-          <button class="run-button" (click)="inspect()" [disabled]="!file || loading"><span class="button-orb"></span>{{ loading ? 'Running checks' : 'Run regression' }} <span class="arrow">&#8594;</span></button>
+          <span class="helper-text" *ngIf="sourceType === 'zip' && !file">A project ZIP with an <code>index.html</code> entry point works best.</span>
+          <span class="helper-text" *ngIf="sourceType === 'repo'">A Git checkout or commit is accepted; the service will inspect the selected tree.</span>
+          <span class="helper-text selected" *ngIf="sourceType === 'zip' && file"><span class="checkmark">&#10003;</span> Package selected</span>
+          <button class="run-button" (click)="inspect()" [disabled]="(sourceType === 'zip' && !file) || (sourceType === 'repo' && !repoPath.trim()) || loading"><span class="button-orb"></span>{{ loading ? 'Running checks' : 'Run regression' }} <span class="arrow">&#8594;</span></button>
         </div>
         <p class="error" *ngIf="error"><strong>Run could not start.</strong> {{ error }}</p>
       </section>
@@ -56,6 +70,24 @@ import JSZip from 'jszip';
           <article class="test-card"><div class="test-card-head"><span>SECURITY SCAN</span><b [class.bad-text]="result.securityStatus === 'findings'" [class.warn-text]="result.securityStatus === 'not_run'">{{ result.securityStatus === 'passed' ? 'NO MEDIUM/HIGH ALERTS' : result.securityStatus === 'findings' ? 'FINDINGS DETECTED' : 'NOT COMPLETED' }}</b></div><p>{{ result.scanType }}</p><small>Target: {{ result.scanTarget }}</small><div class="risk-counts"><span>High <strong>{{ result.securityCounts?.high ?? 0 }}</strong></span><span>Medium <strong>{{ result.securityCounts?.medium ?? 0 }}</strong></span><span>Low <strong>{{ result.securityCounts?.low ?? 0 }}</strong></span><span>Info <strong>{{ result.securityCounts?.informational ?? 0 }}</strong></span></div><small class="bad-text" *ngIf="result.securityError">{{ result.securityError }}</small></article>
         </div>
         <div class="details"><div><span>ENTRY POINT</span><strong>{{ result.entryPoint || 'Not detected' }}</strong></div><div><span>BROWSER TITLE</span><strong>{{ result.title || 'Not available' }}</strong></div></div>
+        <div class="workflow" *ngIf="result.workflow?.length">
+          <h3>Workflow progress</h3>
+          <div class="workflow-list">
+            <article class="workflow-stage" *ngFor="let stage of result.workflow; let i = index">
+              <button type="button" class="workflow-toggle" (click)="toggleStage(i)">
+                <span class="stage-name">{{ stage.name }}</span>
+                <span class="stage-status" [class.failed]="stage.status === 'failed'" [class.passed]="stage.status === 'passed'">{{ stage.status }}</span>
+              </button>
+              <div class="stage-logs" *ngIf="expandedStage === i">
+                <div *ngFor="let log of stage.logs ?? []" class="log-line">
+                  <small>{{ log.timestamp }}</small>
+                  <span class="log-level">{{ log.level }}</span>
+                  <span>{{ log.message }}</span>
+                </div>
+              </div>
+            </article>
+          </div>
+        </div>
         <div class="alerts" *ngIf="result.securityAlerts?.length"><h3>Security alerts</h3><article *ngFor="let alert of result.securityAlerts" class="alert-row"><div><strong>{{ alert.name }}</strong><small>{{ alert.url }}</small></div><b [class.bad-text]="alert.risk === 'High' || alert.risk === 'Medium'">{{ alert.risk }}</b></article></div>
         <p class="scan-note">A PASS means this configured ZAP scan found no Medium/High-risk alerts. It does not prove the application is vulnerability-free. Active scanning sends test payloads; use it only against the isolated Juice Shop lab.</p>
       </section>
@@ -66,12 +98,16 @@ import JSZip from 'jszip';
 })
 class AppComponent {
   file?: File;
+  sourceType: 'zip' | 'repo' = 'zip';
+  repoPath = '.';
+  commitId = '';
   loading = false;
   targetUrl = '';
   activeScan = false;
   darkMode = localStorage.getItem('batch5ztr-theme') === 'dark';
   result?: InspectionResult;
   error = '';
+  expandedStage: number | null = null;
 
   constructor() {
     this.applyTheme();
@@ -95,32 +131,49 @@ class AppComponent {
     this.applyTheme();
   }
 
+  toggleStage(index: number) {
+    this.expandedStage = this.expandedStage === index ? null : index;
+  }
+
   private applyTheme() {
     document.body.classList.toggle('dark-theme', this.darkMode);
   }
 
   async inspect() {
-    if (!this.file) return;
     this.loading = true;
     this.result = undefined;
     this.error = '';
     try {
-      if (!this.file.name.toLowerCase().endsWith('.zip')) {
-        throw new Error('Choose a ZIP containing the complete project.');
+      if (this.sourceType === 'zip') {
+        if (!this.file) throw new Error('Choose a ZIP containing the complete project.');
+        if (!this.file.name.toLowerCase().endsWith('.zip')) {
+          throw new Error('Choose a ZIP containing the complete project.');
+        }
+        if (this.file.size > 200 * 1024 * 1024) {
+          throw new Error('ZIP upload exceeds the 200 MB limit.');
+        }
+        const archive = await JSZip.loadAsync(this.file);
+        const files = Object.keys(archive.files).filter(fileName => !archive.files[fileName].dir).sort();
+        if (!files.some(fileName => fileName.endsWith('index.html'))) {
+          throw new Error('The package must contain an index.html entry point.');
+        }
+      } else {
+        if (!this.repoPath.trim()) {
+          throw new Error('Provide a repository path or use "." for the current checkout.');
+        }
       }
-      if (this.file.size > 200 * 1024 * 1024) {
-        throw new Error('ZIP upload exceeds the 200 MB limit.');
-      }
-      const archive = await JSZip.loadAsync(this.file);
-      const files = Object.keys(archive.files).filter(fileName => !archive.files[fileName].dir).sort();
-      if (!files.some(fileName => fileName.endsWith('index.html'))) {
-        throw new Error('The package must contain an index.html entry point.');
-      }
+
       const response = await fetch('/regress', {
         method: 'POST',
         body: (() => {
           const data = new FormData();
-          data.append('file', this.file!);
+          data.append('source_type', this.sourceType);
+          if (this.sourceType === 'zip') {
+            data.append('file', this.file!);
+          } else {
+            data.append('repo_path', this.repoPath.trim() || '.');
+            if (this.commitId.trim()) data.append('commit_id', this.commitId.trim());
+          }
           if (this.targetUrl.trim()) data.append('target_url', this.targetUrl.trim());
           data.append('active_scan', String(this.activeScan));
           return data;
@@ -131,12 +184,12 @@ class AppComponent {
       try {
         body = JSON.parse(responseText) as InspectionResult & { detail?: string };
       } catch {
-        throw new Error(`Regression service returned HTTP ${response.status}. The project ZIP may be too large.`);
+        throw new Error(`Regression service returned HTTP ${response.status}. The project package may be invalid.`);
       }
       if (!response.ok) throw new Error(body.detail ?? 'Regression failed.');
       this.result = body;
     } catch (error) {
-      this.error = error instanceof Error ? error.message : 'The ZIP could not be inspected.';
+      this.error = error instanceof Error ? error.message : 'The project could not be inspected.';
     } finally {
       this.loading = false;
     }
@@ -165,6 +218,7 @@ interface InspectionResult {
   scanType?: string;
   scanTarget?: string;
   activeScan?: boolean;
+  workflow?: Array<{ name: string; status: string; logs?: Array<{ timestamp: string; level: string; message: string }> }>;
 }
 
 bootstrapApplication(AppComponent);

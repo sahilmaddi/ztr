@@ -1,9 +1,13 @@
+import io
 import os
 import shutil
+import subprocess
+import tarfile
 import tempfile
 import threading
 import time
 import zipfile
+from datetime import datetime, timezone
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PurePosixPath
 from typing import Any, TypedDict
@@ -70,6 +74,9 @@ def is_generated_path(name: str) -> bool:
 
 class RegressionState(TypedDict, total=False):
     archive_path: str
+    repo_path: str
+    commit_id: str
+    patch_path: str
     workspace: str
     target_url: str
     active_scan: bool
@@ -87,70 +94,188 @@ class RegressionState(TypedDict, total=False):
     low_count: int
     info_count: int
     status: str
+    workflow: list[dict[str, Any]]
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def ensure_stage(state: RegressionState, name: str) -> dict[str, Any]:
+    workflow = state.setdefault("workflow", [])
+    stage = next((entry for entry in workflow if entry.get("name") == name), None)
+    if stage is None:
+        stage = {"name": name, "status": "running", "started_at": utc_now_iso(), "logs": []}
+        workflow.append(stage)
+    else:
+        stage["status"] = "running"
+        stage.setdefault("started_at", utc_now_iso())
+    return stage
+
+
+def stage_log(state: RegressionState, stage_name: str, message: str, level: str = "INFO") -> None:
+    stage = ensure_stage(state, stage_name)
+    stage.setdefault("logs", []).append({
+        "timestamp": utc_now_iso(),
+        "level": level,
+        "message": message,
+    })
+
+
+def stage_complete(state: RegressionState, stage_name: str, status: str, message: str | None = None, level: str = "INFO") -> None:
+    stage = ensure_stage(state, stage_name)
+    stage["status"] = status
+    stage["finished_at"] = utc_now_iso()
+    if message is not None:
+        stage_log(state, stage_name, message, level)
+
+
+def list_project_files(workspace: str) -> list[str]:
+    files: list[str] = []
+    for root, dirs, filenames in os.walk(workspace):
+        dirs[:] = [name for name in dirs if not is_generated_path(os.path.relpath(os.path.join(root, name), workspace))]
+        for filename in filenames:
+            relative = os.path.relpath(os.path.join(root, filename), workspace).replace("\\", "/")
+            if is_generated_path(relative):
+                continue
+            files.append(relative)
+    return sorted(files)
+
+
+def inspect_repository(state: RegressionState) -> RegressionState:
+    stage_name = "inspect_archive"
+    stage_log(state, stage_name, "Preparing repository workspace for regression analysis.")
+    repo_path = state.get("repo_path") or "."
+    commit_id = (state.get("commit_id") or "").strip()
+    workspace = tempfile.mkdtemp(prefix="regression-")
+    try:
+        source_path = os.path.abspath(os.path.expanduser(repo_path))
+        stage_log(state, stage_name, f"Using repository path: {source_path}")
+        if not os.path.exists(source_path):
+            raise ValueError(f"Repository path does not exist: {repo_path}")
+
+        if commit_id:
+            stage_log(state, stage_name, f"Resolving commit/ref {commit_id} in repository.")
+            result = subprocess.run(
+                ["git", "-C", source_path, "rev-parse", "--verify", commit_id],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if result.returncode != 0:
+                raise ValueError(f"Commit or ref not found in repository: {commit_id}")
+            archive = subprocess.run(
+                ["git", "-C", source_path, "archive", "--format=tar", commit_id],
+                capture_output=True,
+                check=False,
+            )
+            if archive.returncode != 0:
+                raise ValueError(f"Unable to archive revision {commit_id}")
+            with tarfile.open(fileobj=io.BytesIO(archive.stdout), mode="r:") as archive_file:
+                archive_file.extractall(path=workspace)
+        else:
+            stage_log(state, stage_name, "Copying working tree into a clean regression workspace.")
+            shutil.copytree(source_path, workspace, dirs_exist_ok=True)
+
+        patch_path = state.get("patch_path")
+        if patch_path:
+            stage_log(state, stage_name, f"Applying patch file: {patch_path}")
+            subprocess.run(["git", "apply", "--unsafe-paths", "--directory", workspace, patch_path], check=True)
+
+        files = list_project_files(workspace)
+        candidates = [name for name in files if PurePosixPath(name).name.lower() == "index.html"]
+        if not candidates:
+            raise ValueError("Zero-touch demo currently requires an index.html entry point.")
+        entry = min(candidates, key=lambda name: (len(PurePosixPath(name).parts), name))
+        stage_log(state, stage_name, f"Detected entry point: {entry}")
+        stage_complete(state, stage_name, "passed", f"Repository inspection completed for {entry}.")
+        return {"workspace": workspace, "files": files, "entry_point": entry}
+    except Exception as error:
+        stage_complete(state, stage_name, "failed", str(error), "ERROR")
+        shutil.rmtree(workspace, ignore_errors=True)
+        raise
 
 
 def inspect_archive(state: RegressionState) -> RegressionState:
+    stage_name = "inspect_archive"
+    stage_log(state, stage_name, "Starting archive or repository inspection for the regression package.")
     workspace = tempfile.mkdtemp(prefix="regression-")
     try:
-        files: list[str] = []
-        total_size = 0
-        with zipfile.ZipFile(state["archive_path"]) as archive:
-            entries = archive.infolist()
-            if len(entries) > MAX_ARCHIVE_FILES:
-                raise ValueError(f"ZIP contains too many entries (maximum {MAX_ARCHIVE_FILES}).")
-            for member in entries:
-                normalized_name = member.filename.replace("\\", "/")
-                path = Path(normalized_name)
-                if path.is_absolute() or ".." in path.parts:
-                    raise ValueError("Archive contains an unsafe path.")
-                if member.file_size < 0:
-                    raise ValueError("Archive contains an invalid file size.")
-                if not member.is_dir() and not is_generated_path(normalized_name):
-                    total_size += member.file_size
-                    files.append(normalized_name)
-            if total_size > MAX_EXTRACTED_BYTES:
-                raise ValueError("Uncompressed project exceeds the 500 MB safety limit.")
+        archive_path = state.get("archive_path")
+        if archive_path:
+            files: list[str] = []
+            total_size = 0
+            stage_log(state, stage_name, f"Opening ZIP archive: {archive_path}")
+            with zipfile.ZipFile(archive_path) as archive:
+                entries = archive.infolist()
+                if len(entries) > MAX_ARCHIVE_FILES:
+                    raise ValueError(f"ZIP contains too many entries (maximum {MAX_ARCHIVE_FILES}).")
+                for member in entries:
+                    normalized_name = member.filename.replace("\\", "/")
+                    path = Path(normalized_name)
+                    if path.is_absolute() or ".." in path.parts:
+                        raise ValueError("Archive contains an unsafe path.")
+                    if member.file_size < 0:
+                        raise ValueError("Archive contains an invalid file size.")
+                    if not member.is_dir() and not is_generated_path(normalized_name):
+                        total_size += member.file_size
+                        files.append(normalized_name)
+                if total_size > MAX_EXTRACTED_BYTES:
+                    raise ValueError("Uncompressed project exceeds the 500 MB safety limit.")
 
-            candidates = [name for name in files if PurePosixPath(name).name.lower() == "index.html"]
-            if not candidates:
-                raise ValueError("Zero-touch demo currently requires an index.html entry point.")
-            # Prefer the shallowest index.html.
-            entry = min(candidates, key=lambda name: (len(PurePosixPath(name).parts), name))
+                candidates = [name for name in files if PurePosixPath(name).name.lower() == "index.html"]
+                if not candidates:
+                    raise ValueError("Zero-touch demo currently requires an index.html entry point.")
+                entry = min(candidates, key=lambda name: (len(PurePosixPath(name).parts), name))
 
-            written = 0
-            for member in entries:
-                normalized_name = member.filename.replace("\\", "/")
-                if is_generated_path(normalized_name):
-                    continue
-                target = Path(workspace) / normalized_name
-                if member.is_dir():
-                    target.mkdir(parents=True, exist_ok=True)
-                    continue
-                target.parent.mkdir(parents=True, exist_ok=True)
-                with archive.open(member) as source, target.open("wb") as destination:
-                    # Count real bytes, not the sizes the archive claims.
-                    while chunk := source.read(1024 * 1024):
-                        written += len(chunk)
-                        if written > MAX_EXTRACTED_BYTES:
-                            raise ValueError("Uncompressed project exceeds the 500 MB safety limit.")
-                        destination.write(chunk)
-    except Exception:
+                written = 0
+                for member in entries:
+                    normalized_name = member.filename.replace("\\", "/")
+                    if is_generated_path(normalized_name):
+                        continue
+                    target = Path(workspace) / normalized_name
+                    if member.is_dir():
+                        target.mkdir(parents=True, exist_ok=True)
+                        continue
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    with archive.open(member) as source, target.open("wb") as destination:
+                        while chunk := source.read(1024 * 1024):
+                            written += len(chunk)
+                            if written > MAX_EXTRACTED_BYTES:
+                                raise ValueError("Uncompressed project exceeds the 500 MB safety limit.")
+                            destination.write(chunk)
+            stage_log(state, stage_name, f"Extracted {len(files)} files and detected entry point {entry}.")
+            stage_complete(state, stage_name, "passed", "Archive inspection completed successfully.")
+            return {"workspace": workspace, "files": sorted(files), "entry_point": entry}
+
+        repo_path = state.get("repo_path")
+        if repo_path or state.get("commit_id"):
+            return inspect_repository(state)
+        raise ValueError("No ZIP package or repository path was provided.")
+    except Exception as error:
+        stage_complete(state, stage_name, "failed", str(error), "ERROR")
         shutil.rmtree(workspace, ignore_errors=True)
         raise
-    return {"workspace": workspace, "files": sorted(files), "entry_point": entry}
 
 
 def serve_application(state: RegressionState) -> RegressionState:
+    stage_name = "serve_application"
+    stage_log(state, stage_name, "Starting the static file server for the extracted web project.")
     global FILE_SERVER, FILE_ROOT
     FILE_ROOT = state["workspace"]
     if FILE_SERVER is None:
         handler = lambda *args, **kwargs: LabHandler(*args, directory=FILE_ROOT, **kwargs)
         FILE_SERVER = ThreadingHTTPServer(("0.0.0.0", FILE_SERVER_PORT), handler)
         threading.Thread(target=FILE_SERVER.serve_forever, daemon=True).start()
-    return {"url": f"http://regression:{FILE_SERVER_PORT}/{quote(state['entry_point'])}"}
+    url = f"http://regression:{FILE_SERVER_PORT}/{quote(state['entry_point'])}"
+    stage_log(state, stage_name, f"Application is being served at {url}")
+    stage_complete(state, stage_name, "passed", "Static app server ready.")
+    return {"url": url}
 
 
 def run_browser_regression(state: RegressionState) -> RegressionState:
+    stage_name = "run_browser_regression"
+    stage_log(state, stage_name, "Launching Selenium headless browser to smoke-test the application.")
     options = Options()
     options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
@@ -162,6 +287,7 @@ def run_browser_regression(state: RegressionState) -> RegressionState:
         last_error = None
         for _ in range(30):
             try:
+                stage_log(state, stage_name, f"Connecting to Selenium at {selenium_url}")
                 driver = webdriver.Remote(command_executor=selenium_url, options=options)
                 break
             except Exception as error:
@@ -170,14 +296,20 @@ def run_browser_regression(state: RegressionState) -> RegressionState:
         if driver is None:
             raise RuntimeError(f"Selenium browser did not become ready: {last_error}")
         driver.set_page_load_timeout(45)
+        stage_log(state, stage_name, f"Loading page: {page_url}")
         driver.get(page_url)
         if driver.current_url.startswith("chrome-error:"):
             raise ValueError("The browser could not load the page.")
         if driver.title == "Error response" or not driver.find_elements("tag name", "body"):
             raise ValueError("The page did not render a usable document.")
-        return {"title": driver.title, "functional_status": "passed", "functional_error": ""}
+        title = driver.title
+        stage_log(state, stage_name, f"Smoke test passed; document title: {title}")
+        stage_complete(state, stage_name, "passed", "Browser smoke test passed.")
+        return {"title": title, "functional_status": "passed", "functional_error": ""}
     except Exception as error:
-        return {"functional_status": "failed", "functional_error": str(error)[:500]}
+        message = str(error)[:500]
+        stage_complete(state, stage_name, "failed", message, "ERROR")
+        return {"functional_status": "failed", "functional_error": message}
     finally:
         if driver:
             driver.quit()
@@ -192,15 +324,22 @@ def zap_request(path: str, params: dict[str, Any] | None = None) -> dict[str, An
 
 def run_security_scan(state: RegressionState) -> RegressionState:
     """Run ZAP spider + passive rules; active scanning is opt-in and limited to the Juice Shop lab."""
+    stage_name = "run_security_scan"
+    stage_log(state, stage_name, "Starting OWASP ZAP security scan pipeline.")
     target = state.get("target_url") or state["url"]
+    stage_log(state, stage_name, f"Target: {target}")
     parsed = urlsplit(target)
     if parsed.scheme != "http" or parsed.hostname not in ({"regression"} | ALLOWED_LAB_HOSTS):
+        stage_complete(state, stage_name, "failed", "Target is outside the allowed local lab hosts.", "ERROR")
         return {"security_status": "not_run", "security_error": "Target is outside the allowed local lab hosts.", "security_alerts": []}
     if parsed.hostname in ALLOWED_LAB_HOSTS and parsed.port != 3000:
+        stage_complete(state, stage_name, "failed", "The Juice Shop lab target must use port 3000.", "ERROR")
         return {"security_status": "not_run", "security_error": "The Juice Shop lab target must use port 3000.", "security_alerts": []}
     if parsed.hostname == "regression" and parsed.port != FILE_SERVER_PORT:
+        stage_complete(state, stage_name, "failed", "The uploaded-package target must use port 8101.", "ERROR")
         return {"security_status": "not_run", "security_error": "The uploaded-package target must use port 8101.", "security_alerts": []}
     if state.get("active_scan") and parsed.hostname not in ALLOWED_LAB_HOSTS:
+        stage_complete(state, stage_name, "failed", "Active scanning is allowed only for the configured local Juice Shop lab target.", "ERROR")
         return {"security_status": "not_run", "security_error": "Active scanning is allowed only for the configured local Juice Shop lab target.", "security_alerts": []}
 
     origin = f"{parsed.scheme}://{parsed.netloc}"
@@ -216,6 +355,7 @@ def run_security_scan(state: RegressionState) -> RegressionState:
         if not ready:
             raise RuntimeError("OWASP ZAP did not become ready. Check the zap container logs.")
 
+        stage_log(state, stage_name, "OWASP ZAP is ready; clearing prior alerts and beginning passively targeted crawl.")
         # ZAP keeps alerts between runs; clear them so this report only shows this run.
         zap_request("/JSON/core/action/deleteAllAlerts/")
 
@@ -223,6 +363,7 @@ def run_security_scan(state: RegressionState) -> RegressionState:
         scan_id = spider.get("scan")
         if scan_id is None:
             raise RuntimeError(f"ZAP did not start its spider: {spider}")
+        stage_log(state, stage_name, f"Spider scan started with ID {scan_id}")
         for _ in range(90):
             progress = zap_request("/JSON/spider/view/status/", {"scanId": scan_id})
             if int(progress.get("status", 0)) >= 100:
@@ -242,6 +383,7 @@ def run_security_scan(state: RegressionState) -> RegressionState:
             active_id = active.get("scan")
             if active_id is None:
                 raise RuntimeError(f"ZAP did not start the active scan: {active}")
+            stage_log(state, stage_name, f"Active scan started with ID {active_id}")
             for _ in range(240):
                 progress = zap_request("/JSON/ascan/view/status/", {"scanId": active_id})
                 if int(progress.get("status", 0)) >= 100:
@@ -268,6 +410,8 @@ def run_security_scan(state: RegressionState) -> RegressionState:
                 counts[item["risk"]] += 1
         threshold = RISK_RANK[FAIL_ON_RISK]
         failing = any(RISK_RANK.get(item["risk"], 0) >= threshold for item in cleaned)
+        message = "No medium/high alerts found." if not failing else f"Detected {sum(1 for item in cleaned if RISK_RANK.get(item['risk'], 0) >= threshold)} failing alert(s)."
+        stage_complete(state, stage_name, "passed" if not failing else "failed", message)
         return {
             "security_status": "findings" if failing else "passed",
             "security_alerts": cleaned,
@@ -277,18 +421,23 @@ def run_security_scan(state: RegressionState) -> RegressionState:
             "info_count": counts["Informational"],
         }
     except Exception as error:
-        return {"security_status": "not_run", "security_error": str(error)[:500], "security_alerts": []}
+        message = str(error)[:500]
+        stage_complete(state, stage_name, "failed", message, "ERROR")
+        return {"security_status": "not_run", "security_error": message, "security_alerts": []}
 
 
 def build_report(state: RegressionState) -> RegressionState:
+    stage_name = "build_report"
+    stage_log(state, stage_name, "Synthesizing final regression status from the stage results.")
     functional = state.get("functional_status", "failed")
     security = state.get("security_status", "not_run")
     if functional != "passed" or security == "findings":
         overall = "failed"
     elif security != "passed":
-        overall = "incomplete"  # browser check passed but ZAP did not run
+        overall = "incomplete"
     else:
         overall = "passed"
+    stage_complete(state, stage_name, overall, f"Overall regression status: {overall}.")
     return {"status": overall}
 
 
@@ -320,23 +469,35 @@ def health() -> dict[str, str]:
 # scan does not freeze the event loop or /health.
 @app.post("/regress")
 def regress(
-    file: UploadFile = File(...),
+    file: UploadFile | None = File(None),
+    source_type: str = Form("zip"),
+    repo_path: str | None = Form(None),
+    commit_id: str | None = Form(None),
     target_url: str | None = Form(None),
     active_scan: bool = Form(False),
 ) -> dict[str, Any]:
-    if not file.filename or not file.filename.lower().endswith(".zip"):
-        raise HTTPException(status_code=400, detail="Upload a ZIP project package.")
+    source_type = (source_type or "zip").strip().lower()
+    if source_type not in {"zip", "repo"}:
+        raise HTTPException(status_code=400, detail="Choose a project source of 'zip' or 'repo'.")
 
-    temporary = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+    if source_type == "zip":
+        if file is None or not file.filename or not file.filename.lower().endswith(".zip"):
+            raise HTTPException(status_code=400, detail="Upload a ZIP project package.")
+    else:
+        repo_path = (repo_path or ".").strip() or "."
+
+    temporary = None
     result: dict[str, Any] = {}
     try:
-        uploaded = 0
-        while chunk := file.file.read(1024 * 1024):
-            uploaded += len(chunk)
-            if uploaded > MAX_UPLOAD_BYTES:
-                raise HTTPException(status_code=413, detail="ZIP upload exceeds the 200 MB limit.")
-            temporary.write(chunk)
-        temporary.close()
+        if source_type == "zip":
+            temporary = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+            uploaded = 0
+            while chunk := file.file.read(1024 * 1024):
+                uploaded += len(chunk)
+                if uploaded > MAX_UPLOAD_BYTES:
+                    raise HTTPException(status_code=413, detail="ZIP upload exceeds the 200 MB limit.")
+                temporary.write(chunk)
+            temporary.close()
 
         target_url = (target_url or "").strip()
         if target_url:
@@ -356,15 +517,22 @@ def regress(
         elif active_scan:
             raise HTTPException(status_code=400, detail="Enter the local Juice Shop URL before enabling active scanning.")
 
+        graph_input: dict[str, Any] = {"target_url": target_url, "active_scan": active_scan}
+        if source_type == "zip":
+            graph_input["archive_path"] = temporary.name
+        else:
+            graph_input["repo_path"] = repo_path
+            graph_input["commit_id"] = (commit_id or "").strip()
+
         with RUN_LOCK:
-            result = REGRESSION_GRAPH.invoke({"archive_path": temporary.name, "target_url": target_url, "active_scan": active_scan})
+            result = REGRESSION_GRAPH.invoke(graph_input)
 
         scan_type = "OWASP ZAP spider + passive rules"
         if result.get("active_scan"):
             scan_type += " + active scan (Juice Shop lab)"
         return {
             "status": result.get("status", "incomplete"),
-            "fileName": file.filename,
+            "fileName": file.filename if file else (repo_path or "repo"),
             "fileCount": len(result.get("files", [])),
             "entryPoint": result.get("entry_point"),
             "url": result.get("url"),
@@ -385,6 +553,10 @@ def regress(
             "scanType": scan_type,
             "scanTarget": result.get("target_url") or result.get("url"),
             "activeScan": result.get("active_scan", False),
+            "sourceType": source_type,
+            "repoPath": repo_path,
+            "commitId": commit_id,
+            "workflow": result.get("workflow", []),
         }
     except HTTPException:
         raise
@@ -393,8 +565,9 @@ def regress(
     except Exception as error:
         raise HTTPException(status_code=502, detail=f"Regression failed: {error}") from error
     finally:
-        temporary.close()
-        Path(temporary.name).unlink(missing_ok=True)
+        if temporary is not None:
+            temporary.close()
+            Path(temporary.name).unlink(missing_ok=True)
         workspace = result.get("workspace")
         if workspace:
             shutil.rmtree(workspace, ignore_errors=True)

@@ -3,6 +3,10 @@
 **/node_modules/
 **/.venv/
 **/__pycache__/
+**/.angular/
+**/dist/
 *.user
 *.suo
 .env
+ci-web-build.zip
+ci-regression-report.json
