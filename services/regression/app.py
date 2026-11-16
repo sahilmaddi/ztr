@@ -108,7 +108,7 @@ def ensure_stage(state: RegressionState, name: str) -> dict[str, Any]:
         stage = {"name": name, "status": "running", "started_at": utc_now_iso(), "logs": []}
         workflow.append(stage)
     else:
-        stage["status"] = "running"
+        stage.setdefault("status", "running")
         stage.setdefault("started_at", utc_now_iso())
     return stage
 
@@ -189,7 +189,7 @@ def inspect_repository(state: RegressionState) -> RegressionState:
         entry = min(candidates, key=lambda name: (len(PurePosixPath(name).parts), name))
         stage_log(state, stage_name, f"Detected entry point: {entry}")
         stage_complete(state, stage_name, "passed", f"Repository inspection completed for {entry}.")
-        return {"workspace": workspace, "files": files, "entry_point": entry}
+        return {"workspace": workspace, "files": files, "entry_point": entry, "workflow": state["workflow"]}
     except Exception as error:
         stage_complete(state, stage_name, "failed", str(error), "ERROR")
         shutil.rmtree(workspace, ignore_errors=True)
@@ -246,7 +246,7 @@ def inspect_archive(state: RegressionState) -> RegressionState:
                             destination.write(chunk)
             stage_log(state, stage_name, f"Extracted {len(files)} files and detected entry point {entry}.")
             stage_complete(state, stage_name, "passed", "Archive inspection completed successfully.")
-            return {"workspace": workspace, "files": sorted(files), "entry_point": entry}
+            return {"workspace": workspace, "files": sorted(files), "entry_point": entry, "workflow": state["workflow"]}
 
         repo_path = state.get("repo_path")
         if repo_path or state.get("commit_id"):
@@ -270,7 +270,7 @@ def serve_application(state: RegressionState) -> RegressionState:
     url = f"http://regression:{FILE_SERVER_PORT}/{quote(state['entry_point'])}"
     stage_log(state, stage_name, f"Application is being served at {url}")
     stage_complete(state, stage_name, "passed", "Static app server ready.")
-    return {"url": url}
+    return {"url": url, "workflow": state["workflow"]}
 
 
 def run_browser_regression(state: RegressionState) -> RegressionState:
@@ -305,11 +305,11 @@ def run_browser_regression(state: RegressionState) -> RegressionState:
         title = driver.title
         stage_log(state, stage_name, f"Smoke test passed; document title: {title}")
         stage_complete(state, stage_name, "passed", "Browser smoke test passed.")
-        return {"title": title, "functional_status": "passed", "functional_error": ""}
+        return {"title": title, "functional_status": "passed", "functional_error": "", "workflow": state["workflow"]}
     except Exception as error:
         message = str(error)[:500]
         stage_complete(state, stage_name, "failed", message, "ERROR")
-        return {"functional_status": "failed", "functional_error": message}
+        return {"functional_status": "failed", "functional_error": message, "workflow": state["workflow"]}
     finally:
         if driver:
             driver.quit()
@@ -331,16 +331,16 @@ def run_security_scan(state: RegressionState) -> RegressionState:
     parsed = urlsplit(target)
     if parsed.scheme != "http" or parsed.hostname not in ({"regression"} | ALLOWED_LAB_HOSTS):
         stage_complete(state, stage_name, "failed", "Target is outside the allowed local lab hosts.", "ERROR")
-        return {"security_status": "not_run", "security_error": "Target is outside the allowed local lab hosts.", "security_alerts": []}
+        return {"security_status": "not_run", "security_error": "Target is outside the allowed local lab hosts.", "security_alerts": [], "workflow": state["workflow"]}
     if parsed.hostname in ALLOWED_LAB_HOSTS and parsed.port != 3000:
         stage_complete(state, stage_name, "failed", "The Juice Shop lab target must use port 3000.", "ERROR")
-        return {"security_status": "not_run", "security_error": "The Juice Shop lab target must use port 3000.", "security_alerts": []}
+        return {"security_status": "not_run", "security_error": "The Juice Shop lab target must use port 3000.", "security_alerts": [], "workflow": state["workflow"]}
     if parsed.hostname == "regression" and parsed.port != FILE_SERVER_PORT:
         stage_complete(state, stage_name, "failed", "The uploaded-package target must use port 8101.", "ERROR")
-        return {"security_status": "not_run", "security_error": "The uploaded-package target must use port 8101.", "security_alerts": []}
+        return {"security_status": "not_run", "security_error": "The uploaded-package target must use port 8101.", "security_alerts": [], "workflow": state["workflow"]}
     if state.get("active_scan") and parsed.hostname not in ALLOWED_LAB_HOSTS:
         stage_complete(state, stage_name, "failed", "Active scanning is allowed only for the configured local Juice Shop lab target.", "ERROR")
-        return {"security_status": "not_run", "security_error": "Active scanning is allowed only for the configured local Juice Shop lab target.", "security_alerts": []}
+        return {"security_status": "not_run", "security_error": "Active scanning is allowed only for the configured local Juice Shop lab target.", "security_alerts": [], "workflow": state["workflow"]}
 
     origin = f"{parsed.scheme}://{parsed.netloc}"
     try:
@@ -419,11 +419,12 @@ def run_security_scan(state: RegressionState) -> RegressionState:
             "medium_count": counts["Medium"],
             "low_count": counts["Low"],
             "info_count": counts["Informational"],
+            "workflow": state["workflow"],
         }
     except Exception as error:
         message = str(error)[:500]
         stage_complete(state, stage_name, "failed", message, "ERROR")
-        return {"security_status": "not_run", "security_error": message, "security_alerts": []}
+        return {"security_status": "not_run", "security_error": message, "security_alerts": [], "workflow": state["workflow"]}
 
 
 def build_report(state: RegressionState) -> RegressionState:
@@ -438,7 +439,7 @@ def build_report(state: RegressionState) -> RegressionState:
     else:
         overall = "passed"
     stage_complete(state, stage_name, overall, f"Overall regression status: {overall}.")
-    return {"status": overall}
+    return {"status": overall, "workflow": state["workflow"]}
 
 
 def create_graph():
