@@ -92,7 +92,7 @@ Create the Gitea user and repository named by `GITEA_REPO_OWNER` and `GITEA_REPO
 
 Jenkins provisions the `ztr-ci` pipeline from the repository's `main` branch on startup. Pushes trigger a build that summarizes the commit range, checks Python syntax, builds Angular, builds and starts the regression services, and submits the built web package to the regression API for Selenium and ZAP analysis. The JSON report is archived as a Jenkins build artifact.
 
-The Jenkins container mounts the Docker Engine socket so it can build and start the project's containers. Access to that socket is effectively host-level control; keep this stack local and do not expose Jenkins or Gitea to the internet. Use unique local secrets and do not commit `.env`.
+The Jenkins container mounts the Docker Engine socket so it can build and start the project's containers. Access to that socket is effectively host-level control; keep this stack local and do not expose Jenkins or Gitea to the internet. Gitea's webhook allowlist is limited to the `jenkins` Compose service. Use unique local secrets and do not commit `.env`.
 
 ## Local Angular development
 
