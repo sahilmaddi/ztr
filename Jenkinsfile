@@ -52,6 +52,8 @@ pipeline {
             steps {
                 sh '''
                     python3 services/jenkins/package_web.py
+                    curl --fail --silent --show-error --retry 30 --retry-connrefused --retry-delay 2 \\
+                        http://regression:8100/health
                     curl --fail --silent --show-error --max-time 900 \\
                         -F "file=@ci-web-build.zip" \\
                         http://regression:8100/regress \\
